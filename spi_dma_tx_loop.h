@@ -18,15 +18,14 @@ extern "C"
 {
 #endif
 
-extern volatile int transfer_count;
+esp_err_t spi_setup(void);
+esp_err_t spi_transfer_loop_start(void);
+esp_err_t spi_transfer_loop_stop(void); // generates interrupt
 
-extern esp_err_t spi_setup(void);
-extern esp_err_t spi_transfer_loop_start(void);
-extern esp_err_t spi_transfer_loop_start_2(void);
-extern esp_err_t spi_transfer_loop_stop(void);
-extern esp_err_t spi_transfer_loop_restart(void);
+int      spi_get_transfer_count();
+bool     spi_seg_transfer_is_complete();
+uint32_t get_gpspi2_intr_val();
 
-extern int spi_get_transfer_count();
 
 #ifdef __cplusplus
 }

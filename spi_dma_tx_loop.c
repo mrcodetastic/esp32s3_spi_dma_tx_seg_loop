@@ -1,6 +1,8 @@
 /***************************************************************************************
-   Abusing the ESP32S3's GPSPI2 for Continuous / Endless Transmit (TX) Loop of
-   Octal SPI (OSPI) output
+   Abusing the ESP32S3's GPSPI2 for Continuous / Endless Transmit (TX) Loop of 
+   Octal SPI (OSPI) output using configure-segmented transfer of < 32kB each segment.
+
+   When a segment loop is completed an interrupt will be triggered.
 
    This enables us not just to be limited to the LCD device with the DMA loop output of
    data to whatever peripheral we want to have connected to continuously receive a
@@ -59,18 +61,32 @@ static const char* const TAG = "gpspi2_spi_dma_tx_loop";
 
 #include <payload.h>
 
+/**************************************************************************************/
+
+intr_handle_t intr_handle;
+static void default_isr_handler(void *args);
+
+DMA_ATTR volatile int  spi_seg_transfer_count = 0;
+DMA_ATTR volatile bool spi_seg_transfer_complete = false;
+
+esp_err_t spi_transfer_initial_payload();
+esp_err_t spi_dma_seg_setup();
+
+DMA_ATTR static uint32_t spi_seg_conf_1[4];
 DMA_ATTR static uint32_t spi_seg_conf_2[4];
 
+DMA_ATTR static uint32_t spi_seg_conf_value_nxt_true;
+DMA_ATTR static uint32_t spi_seg_conf_value_nxt_false;
+
+static int dma_lldesc_required            = 0; // for CONF dma lldesc 
 DMA_ATTR static lldesc_t* dma_data_lldesc = NULL; // for the links required (to be defined)
 
-
-
 /**************************************************************************************/
+
 static const char* const SPI_TAG = "spi_master_custom";
 
 typedef struct spi_device_t spi_device_t;
 static spi_device_handle_t spi_device;
-
 
 /**************************************************************************************/
 /* from spi_master.c; Apache 2.0 */
@@ -82,23 +98,35 @@ static spi_device_handle_t spi_device;
 
 
 /**************************************************************************************/
+IRAM_ATTR static void default_isr_handler(void *args)
+{
+  spi_seg_transfer_count++;
 
-volatile int transfer_count = 0;
-static IRAM_ATTR void dma_isr3(void* param) {
+  //assert(false);
 
-  transfer_count++;
+  spi_seg_transfer_complete = true;
 
   spi_ll_clear_intr(&GPSPI2, SPI_LL_INTR_TRANS_DONE); // need this for the transacion to start
   spi_ll_clear_intr(&GPSPI2, SPI_LL_INTR_SEG_DONE); // need this for the transacion to start
 
 }
  
+int spi_get_transfer_count () {
+  return spi_seg_transfer_count;
+}
+
+IRAM_ATTR bool spi_seg_transfer_is_complete() {
+  return spi_seg_transfer_complete;
+}
+
+uint32_t get_gpspi2_intr_val(){
+  return GPSPI2.dma_int_st.val;
+}
+
 
 
 /**************************************************************************************/
-// Linked List Stuff
-
-// Step 1
+// Step 1 - Create individual dma descriptors for payload
 int lldesc_setup_chunk(lldesc_t *dmadesc, const void *data, int len, int offset) {
     int n = offset;
     while (len) {
@@ -118,7 +146,7 @@ int lldesc_setup_chunk(lldesc_t *dmadesc, const void *data, int len, int offset)
         len -= dmachunklen;
         data += dmachunklen;
 
-        ESP_LOGD(TAG, "Configured dmadesc at pos %d, memory location %08x, pointing to data of size %d", n, (uintptr_t)&dmadesc[n], (int) dmadesc[n].size);
+        ESP_LOGI(TAG, "Configured dmadesc at pos %d, memory location %08x, pointing to data of size %d", n, (uintptr_t)&dmadesc[n], (int) dmadesc[n].size);
         n++;
     }
 
@@ -127,7 +155,7 @@ int lldesc_setup_chunk(lldesc_t *dmadesc, const void *data, int len, int offset)
     return n;
 }
 
-// Step 2
+// Step 2 - Link dma link list descriptors
 void lldesc_setup_chain(lldesc_t *dmadesc, int dma_desc_count, bool loop) {
 
   dma_desc_count--;
@@ -145,7 +173,7 @@ void lldesc_setup_chain(lldesc_t *dmadesc, int dma_desc_count, bool loop) {
     dmadesc[n-1].eof = 0;    
     dmadesc[n-1].qe.stqe_next = &dmadesc[n];     
 
-        ESP_LOGD(TAG, "desc %d points to desc %d", n-1, n);          
+        ESP_LOGI(TAG, "desc %d points to desc %d", n-1, n);          
     
     n--;
   }
@@ -154,13 +182,6 @@ void lldesc_setup_chain(lldesc_t *dmadesc, int dma_desc_count, bool loop) {
 
 }
 /**************************************************************************************/
-int spi_get_transfer_count ()
-{
-  return transfer_count;
-}
-
-
-int dma_lldesc_required = 0; // for CONF dma lldesc 
 esp_err_t spi_setup(void)
 {
   esp_err_t err;
@@ -188,51 +209,6 @@ esp_err_t spi_setup(void)
   // to enable configure-segmented transfers. After that, we should be good to
   // let it run.
 
-  // NOTES:
-  // [Guru Meditation Error: Core  1 panic'ed (Interrupt wdt timeout on CPU1). 
-  //  .... will occur when DMA payload < what SPI payload device is expecting. !
-
-  // If there is ANY difference in the spi_seg_conf_X[1] size VS what the DMA engine 
-  // sends, there will be a timeout / error with SPI.
-
-  ESP_LOGI(TAG, "Initializing DMA Linked-List Descriptors.");
-
-
-  // Initialize config words
-  spi_seg_conf_2[0]  = 0xA0000000UL;  // set magic value
-  /*
-  spi_seg_conf_2[0] |= (0b0000000000000000 | ( 1 << 6) | ( 1 << 12) | (1 << 13));  // SPI_MS_DLEN_REG (bit 6) + SPI_DMA_INT_ENA_REG (bit 12) + SPI_DMA_INT_CLR_REG (bit 13)
-  
-  // SPI_MS_DLEN_REG
-  spi_seg_conf_2[1] = (sizeof(spi_tx_payload_testchunk2) * 8) ; // must match exactly the dma payload total chunk size -1
-
-  // SPI_DMA_INT_ENA_REG  
-  spi_seg_conf_2[2] = 0 | SPI_TRANS_DONE_INT_ENA | SPI_DMA_SEG_TRANS_DONE_INT_ENA | SPI_SEG_MAGIC_ERR_INT_ENA;
-
-  // SPI_DMA_INT_CLR_REG
-  spi_seg_conf_2[3] = 0 | SPI_TRANS_DONE_INT_CLR | SPI_DMA_SEG_TRANS_DONE_INT_CLR | SPI_SEG_MAGIC_ERR_INT_CLR; 
-  */
-
-  // Set up linked lists for next descriptors
-  // lldesc_setup_link is in soc/lldesc.c
-
-  dma_lldesc_required = 1; // for CONF dma lldesc 
-  dma_lldesc_required += lldesc_get_required_num(sizeof(spi_tx_payload_testchunk2)); 
-  ESP_LOGI(TAG, "%d SPI DMA descriptors required for cover spi_tx_payload_chunk2 data.", dma_lldesc_required);   
-
-  // Allocate memory
-  dma_data_lldesc = (lldesc_t*) heap_caps_malloc(sizeof(lldesc_t) * dma_lldesc_required, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);  
-
-  // Future note: Each SPI segment must be < 32kB.
-  lldesc_setup_chunk(dma_data_lldesc, &spi_seg_conf_2, 4*1, 0); // setup dma link list descriptor for CONF data
-  lldesc_setup_chunk(dma_data_lldesc, &spi_tx_payload_testchunk2, sizeof(spi_tx_payload_testchunk2), 1); // setup dma link list descriptors for payload
-
-  lldesc_setup_chain(dma_data_lldesc, dma_lldesc_required, true); // link them all together
-
-
-
-  // If the payload keeps looping on itself without an appropriate header, it'll call a watchdog reset
-
   // Initialize SPI host
   ESP_LOGD(TAG, "Initializing SPI bus");
   
@@ -250,7 +226,7 @@ esp_err_t spi_setup(void)
   host_conf.sclk_io_num  = -1; // clock not used  (therefore don't have SPICOMMON_BUSFLAG_SCLK below )
   host_conf.max_transfer_sz = 32768; //32768 is the max for S3
   host_conf.flags = SPICOMMON_BUSFLAG_OCTAL | SPICOMMON_BUSFLAG_GPIO_PINS | SPICOMMON_BUSFLAG_MASTER;
-  host_conf.intr_flags = 0;
+  host_conf.intr_flags = ESP_INTR_FLAG_SHARED;
   host_conf.isr_cpu_id = INTR_CPU_ID_AUTO;
 
   CHECK_CALLE(spi_bus_initialize(SPI2_HOST, &host_conf, SPI_DMA_CH_AUTO), "Could not initialize SPI bus");
@@ -280,28 +256,20 @@ esp_err_t spi_setup(void)
 
   ESP_LOGD(TAG, "spi_setup() complete");  
 
-  return err;
+  spi_transfer_initial_payload();
+  spi_dma_seg_setup();
+
+  return ESP_OK;
 
 }
 
-// Setup interrupt handler
-  
-esp_err_t spi_transfer_loop_start()
+// Configure all the relevant hardware registers via the use of sending a test payload.
+esp_err_t spi_transfer_initial_payload()
 {
-
-  // Setup interrupt
-  static intr_handle_t intr;
-  esp_intr_alloc        (ETS_SPI2_DMA_INTR_SOURCE,  ESP_INTR_FLAG_SHARED, dma_isr3, NULL, &intr);
-  esp_intr_alloc        (ETS_SPI2_INTR_SOURCE,      ESP_INTR_FLAG_SHARED, dma_isr3, NULL, &intr);  
-  esp_intr_enable       (intr);
-
-  dma_isr3(0); // increase count to 1
-
-
   esp_err_t err;
 
   // Dispatch transaction; link_trans will finish it off
-  ESP_LOGD(TAG, "Initial Transfer");
+  ESP_LOGD(TAG, "Sending Initial Transfer: spi_transfer_setup()");
 
   static spi_transaction_t trans;
   trans.flags     = SPI_TRANS_MODE_OCT;
@@ -315,21 +283,154 @@ esp_err_t spi_transfer_loop_start()
 
   CHECK_CALLE(spi_device_polling_start(spi_device, &trans, portMAX_DELAY), "Could not start SPI transfer");
 
-  //esp_register_shutdown_handler(vga_deinit);
+
   ESP_LOGD(TAG, "spi_transfer_loop_start() complete");
 
   return ESP_OK;
 }
 
-
-esp_err_t spi_transfer_loop_start_2()
+// Setup the DMA segments and config. Must do this after spi_transfer_initial_payload because we do reference the current register values
+esp_err_t spi_dma_seg_setup()
 {
-  // Need to do first start first to set registers.
-  ESP_LOGD(TAG, "Part 2");
+  // NOTES:
+  // [Guru Meditation Error: Core  1 panic'ed (Interrupt wdt timeout on CPU1). 
+  //  .... will occur when DMA payload < what SPI payload device is expecting. !
 
-  // TODO; Figure out a way to get interrupts working, and when the GCLK segement has completed and about to restert - then allow a DCLK / Greyscale transfer
-  //       AT THE SAME TIME
- // esp_intr_alloc_intrstatus(ETS_SPI2_INTR_SOURCE, ESP_INTR_FLAG_SHARED, (uint32_t)&GPSPI2.dma_int_st.val, SPI_DMA_SEG_TRANS_DONE_INT_ENA_M, dma_isr2,  NULL, &intr); 
+  // If there is ANY difference in the spi_seg_conf_X[1] size VS what the DMA engine 
+  // sends, there will be a timeout / error with SPI.
+
+  ESP_LOGD(TAG, "Setup SPI DMA-controlled configurable segmented transfer");
+
+  // This function has already been run, don't do it again! Memory leak.
+  assert ( dma_lldesc_required == 0);
+
+  //
+  // Segment 1
+  //
+  // Initialize config words
+  spi_seg_conf_1[0]  = 0xA0000000UL;  // set magic value
+  spi_seg_conf_1[0]  |= ( 1 << 3) | ( 1 << 6);  // SPI_USER_REG | SPI_MS_DLEN_REG
+
+
+  spi_seg_conf_value_nxt_true   = GPSPI2.user.val | SPI_USR_CONF_NXT;
+  spi_seg_conf_value_nxt_false  = GPSPI2.user.val & ~(SPI_USR_CONF_NXT); 
+
+  // SPI_USER_REG
+  //spi_seg_conf_1[1]  = GPSPI2.user.val | SPI_USR_CONF_NXT; // If this bit is set, it means this configurable segmented transfer will continue its next transaction (segment).
+  spi_seg_conf_1[1]  = spi_seg_conf_value_nxt_true; // If this bit is set, it means this configurable segmented transfer will continue its next transaction (segment).
+
+  // SPI_MS_DLEN_REG
+  spi_seg_conf_1[2] = (sizeof(spi_tx_payload_testchunk2) * 8) -1; // must match exactly the dma payload total chunk size -1
+
+
+  // Set up linked lists for next descriptors
+  // lldesc_setup_link is in soc/lldesc.c
+
+  dma_lldesc_required = 1; // for CONF dma lldesc 
+  dma_lldesc_required += lldesc_get_required_num(sizeof(spi_tx_payload_testchunk2)); 
+  ESP_LOGI(TAG, "%d SPI DMA descriptors required for cover spi_tx_payload_chunk2 data.", dma_lldesc_required);   
+
+  // Allocate memory
+  dma_data_lldesc = (lldesc_t*) heap_caps_malloc(sizeof(lldesc_t) * dma_lldesc_required, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);  
+
+  // Future note: Each SPI segment must be < 32kB.
+  int offset = 0;
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_seg_conf_1, 4*3, 0); // setup dma link list descriptor for CONF data
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_tx_payload_testchunk2, sizeof(spi_tx_payload_testchunk2), offset); // setup dma link list descriptors for payload
+
+  lldesc_setup_chain(dma_data_lldesc, dma_lldesc_required, true); // link them all together
+
+  return ESP_OK;
+
+}
+
+esp_err_t spi_dma_seg_setup_old()
+{
+  // NOTES:
+  // [Guru Meditation Error: Core  1 panic'ed (Interrupt wdt timeout on CPU1). 
+  //  .... will occur when DMA payload < what SPI payload device is expecting. !
+
+  // If there is ANY difference in the spi_seg_conf_X[1] size VS what the DMA engine 
+  // sends, there will be a timeout / error with SPI.
+
+  ESP_LOGD(TAG, "Setup SPI DMA-controlled configurable segmented transfer");
+
+  // This function has already been run, don't do it again! Memory leak.
+  assert ( dma_lldesc_required == 0);
+
+  //
+  // Segment 1
+  //
+  // Initialize config words
+  spi_seg_conf_1[0]  = 0xA0000000UL;  // set magic value
+  spi_seg_conf_1[0]  |= ( 1 << 3) | ( 1 << 6);  // SPI_USER_REG | SPI_MS_DLEN_REG
+
+
+  spi_seg_conf_value_nxt_true   = GPSPI2.user.val | SPI_USR_CONF_NXT;
+  spi_seg_conf_value_nxt_false  = GPSPI2.user.val & ~(SPI_USR_CONF_NXT); 
+
+  // SPI_USER_REG
+  //spi_seg_conf_1[1]  = GPSPI2.user.val | SPI_USR_CONF_NXT; // If this bit is set, it means this configurable segmented transfer will continue its next transaction (segment).
+  spi_seg_conf_1[1]  = spi_seg_conf_value_nxt_true; // If this bit is set, it means this configurable segmented transfer will continue its next transaction (segment).
+
+  // SPI_MS_DLEN_REG
+  spi_seg_conf_1[2] = (sizeof(spi_tx_payload_testchunk2) * 8) -1; // must match exactly the dma payload total chunk size -1
+
+
+  //
+  // Segment 2
+  //
+  // Initialize config words
+  spi_seg_conf_2[0]  = spi_seg_conf_1[0];  // set magic value
+
+  // SPI_USER_REG // clear the sigmented transfer bit
+  // n & ~(1 << k)  
+  //spi_seg_conf_2[1]  = GPSPI2.user.val & ~(SPI_USR_CONF_NXT); // If this bit is set, it means this configurable segmented transfer will continue its next transaction (segment).
+
+  spi_seg_conf_2[1]  = spi_seg_conf_1[1] ; // If this bit is set, it means this configurable segmented transfer will continue its next 
+
+  // SPI_MS_DLEN_REG
+  spi_seg_conf_2[2] = spi_seg_conf_1[2]; // 
+
+
+  // Set up linked lists for next descriptors
+  // lldesc_setup_link is in soc/lldesc.c
+
+  dma_lldesc_required = 1; // for CONF dma lldesc 
+  dma_lldesc_required += lldesc_get_required_num(sizeof(spi_tx_payload_testchunk2)); 
+
+  dma_lldesc_required *= 2;
+  ESP_LOGI(TAG, "%d SPI DMA descriptors required for cover spi_tx_payload_chunk2 data.", dma_lldesc_required);   
+
+  // Allocate memory
+  dma_data_lldesc = (lldesc_t*) heap_caps_malloc(sizeof(lldesc_t) * dma_lldesc_required, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);  
+
+  // Future note: Each SPI segment must be < 32kB.
+  int offset = 0;
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_seg_conf_1, 4*3, 0); // setup dma link list descriptor for CONF data
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_tx_payload_testchunk2, sizeof(spi_tx_payload_testchunk2), offset); // setup dma link list descriptors for payload
+
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_seg_conf_2, 4*3, offset); // setup dma link list descriptor for CONF data
+  offset = lldesc_setup_chunk(dma_data_lldesc, &spi_tx_payload_testchunk2, sizeof(spi_tx_payload_testchunk2), offset); // setup dma link list descriptors for payload  
+
+  lldesc_setup_chain(dma_data_lldesc, dma_lldesc_required, true); // link them all together
+
+  return ESP_OK;
+
+}
+
+
+
+esp_err_t spi_transfer_loop_start()
+{
+  esp_err_t ret;
+
+  // Need to do first start first to set registers.
+  ESP_LOGD(TAG, "Starting Output Loop");
+
+  // Ensure we keep looping, not interrupt when it reads the conf word
+  spi_seg_conf_1[1]  = spi_seg_conf_value_nxt_true; // If this bit is set, it means this configurable segmented transfer will continue its next 
+
 
   GPSPI2.slave.dma_seg_magic_value = 0xA;
 
@@ -342,32 +443,27 @@ esp_err_t spi_transfer_loop_start_2()
   spi_ll_dma_tx_enable(&GPSPI2, 1);
   spi_dma_ll_tx_start(&GDMA, bus_attr->tx_dma_chan, &dma_data_lldesc[0]);  
 
+  GPSPI2.slave.usr_conf = 1;  // Enable user conf for segmented transfers
 
-
-  GPSPI2.slave.usr_conf = 1;  // Enable user conf for segmented transfers 
-  GPSPI2.user.usr_conf_nxt = 1;  
+  //GPSPI2.user.usr_conf_nxt = 1;  //  If this bit is set, it means this configurable segmented transfer will continue its  ext transaction (segment). If this bit is cleared, it means this transfer will end after the current transaction  segment) is finished. Or this is not a configurable segmented transfer.
   
   GPSPI2.misc.cs0_dis = 1;    // turn off client select pin
 
-  // 13. Set SPI_DMA_SEG_TRANS_DONE_INT_ENA to enable the SPI_DMA_SEG_TRANS_DONE_INT interrupt.
-  //     Configure other interrupts if needed according to Section 30.10.
-  //esp_intr_free(spi_device->host->intr);
-  spi_ll_clear_intr(&GPSPI2, SPI_LL_INTR_TRANS_DONE); // need this for the transacion to start
-  spi_ll_clear_intr(&GPSPI2, SPI_LL_INTR_SEG_DONE); // need this for the transacion to start
+  // Clear interrupt vectors
+  GPSPI2.dma_int_clr.dma_seg_trans_done = 1; // Doesn't work, so can't use it. :-(
+  GPSPI2.dma_int_clr.trans_done = 1; // Doesn't work, so can't use it. :-(
 
+  // Enable if not already enabled
   GPSPI2.dma_int_ena.dma_seg_trans_done = 1; // Doesn't work, so can't use it. :-(
   GPSPI2.dma_int_ena.trans_done = 1; // Doesn't work, so can't use it. :-(
-    
-  GPSPI2.cmd.conf_bitlen = 0;
 
-  // Configure interrupt
-  // TODO; Figure out a way to get interrupts working, and when the GCLK segement has completed and about to restert - then allow a DCLK / Greyscale transfer
-  //       AT THE SAME TIME
- // esp_intr_alloc_intrstatus(ETS_SPI2_INTR_SOURCE, ESP_INTR_FLAG_SHARED, (uint32_t)&GPSPI2.dma_int_st.val, SPI_DMA_SEG_TRANS_DONE_INT_ENA_M, dma_isr2,  NULL, &intr); 
+  ret = esp_intr_free(intr_handle);
 
-  //esp_intr_free(spi_device->host->intr);
-  //spi_ll_clear_int_stat (spi_device->host->hal.hw);
+  ret = esp_intr_alloc_intrstatus(ETS_SPI2_INTR_SOURCE, ESP_INTR_FLAG_SHARED, (uint32_t)&GPSPI2.dma_int_st.val, (SPI_DMA_SEG_TRANS_DONE_INT_ENA_M | SPI_SEG_MAGIC_ERR_INT_ENA_M | SPI_TRANS_DONE_INT_ENA_M), default_isr_handler,  NULL, &intr_handle); 
+  assert(ret == ESP_OK);
 
+  ret = esp_intr_enable(intr_handle);
+  assert(ret == ESP_OK);
 
   GPSPI2.cmd.update = 1;
   while (GPSPI2.cmd.update);    //waiting config applied  
@@ -375,52 +471,67 @@ esp_err_t spi_transfer_loop_start_2()
   // start trans
   GPSPI2.cmd.usr = 1;  
 
-  //esp_register_shutdown_handler(vga_deinit);
-  ESP_LOGD(TAG, "spi_transfer_loop_start_2() complete");
+  spi_seg_transfer_complete = false;
+
+  return ESP_OK;
+
+}
+
+
+// This will generate an interrupt due to the SPI_USR_CONF_NST being ZERO'd
+esp_err_t spi_transfer_loop_stop(void) {
+
+  ESP_LOGD(TAG, "Calling spi_transfer_loop_stop()");  
+
+  //spi_seg_conf_2[1]  = GPSPI2.user.val & ~(SPI_USR_CONF_NXT); // If this bit is set, it means this configurable segmented transfer will continue its next 
+
+  spi_seg_conf_1[1]  = spi_seg_conf_value_nxt_false; // If this bit is set, it means this configurable segmented transfer will continue its next 
+
+  // Wait until completion.
+  while (!spi_seg_transfer_complete);
 
   return ESP_OK;
 }
 
 
 
-
-
-
-
 // Doesn't quite clean up cleanly.
-esp_err_t spi_transfer_loop_restart(void) {
+esp_err_t spi_dma_transfer_loop_unpause(void) {
+
+  ESP_LOGD(TAG, "Calling spi_dma_transfer_loop_unpause()");    
 
   const spi_bus_attr_t* bus_attr = spi_bus_get_attr(SPI2_HOST); 
 
-  ESP_LOGD(TAG, "Allocated DMA Channel is %d", bus_attr->tx_dma_chan);
+  //ESP_LOGD(TAG, "Allocated DMA Channel is %d", bus_attr->tx_dma_chan);
 
   dma_data_lldesc[dma_lldesc_required-1].eof = 0;
   dma_data_lldesc[dma_lldesc_required-1].qe.stqe_next = &dma_data_lldesc[0];  
 
+  // Continue sending shit to the SPI peripheral like nothing happened.
   gdma_ll_tx_start(&GDMA, bus_attr->tx_dma_chan);
 
-return ESP_OK;
+  return ESP_OK;
 
 }
 
 
-// Doesn't quite clean up cleanly.
-esp_err_t spi_transfer_loop_stop(void) {
+// This stops the DMA engine from sending data to the SPI periphal, but does NOT generate a SPI interrupt
+// as the SPI periphal is in limbo waiting for data I presume.
+esp_err_t spi_dma_transfer_loop_pause(void) {
+
+  ESP_LOGD(TAG, "Calling spi_dma_transfer_loop_pause()");    
 
   const spi_bus_attr_t* bus_attr = spi_bus_get_attr(SPI2_HOST);   
-
-  // Disconnect the looping DMA transfer to cause the transfer to finish
-  ESP_LOGD(TAG, "Calling spi_transfer_loop_stop()");  
 
   // Point to end, must ensure we give the SPI perip all the data it expects, so only
   // set the chain to null at the end of the payload dma descriptors.
   // If we don't do this, and don't send all the payload in DMA memory to the SPI device
   // we'll get a CPU fault / watchdog reset.
-
-  //spi_seg_conf_2[0] = 0;
-
   dma_data_lldesc[dma_lldesc_required-1].eof = 1;
   dma_data_lldesc[dma_lldesc_required-1].qe.stqe_next = NULL;
 
   return ESP_OK;
 }
+
+
+
