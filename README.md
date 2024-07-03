@@ -9,5 +9,6 @@ The transmission can be restarted.
 
 ## As seen in Pulseview
 The gap between stopping a transmission, waiting for completion (via interrupt) and then restarting is only a few milliseconds.
+
 ![image](https://github.com/mrcodetastic/esp32s3_spi_dma_tx_seg_loop/assets/12006953/f69701cb-33b3-4cfb-963a-f1483dc93b91)
 
