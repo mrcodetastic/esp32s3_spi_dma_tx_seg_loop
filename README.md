@@ -5,7 +5,8 @@ The transmission can be restarted.
 
 ## Logic flow
 
-![image](https://github.com/mrcodetastic/esp32s3_spi_dma_tx_seg_loop/assets/12006953/c6d3d43c-46eb-4b1c-8cde-4576bbba1eec)
+![image](https://github.com/mrcodetastic/esp32s3_spi_dma_tx_seg_loop/assets/12006953/7ee6f797-2124-484c-b6ed-f23f678bd1c5)
+
 
 ## As seen in Pulseview
 The gap between stopping a transmission, waiting for completion (via interrupt) and then restarting is only a few milliseconds.
